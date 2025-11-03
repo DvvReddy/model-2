@@ -45,16 +45,35 @@ st.markdown("""
 @st.cache_resource
 def load_models():
     """Load all trained models"""
-    models = {
-        'spending': joblib.load('artifacts/model_1_spending.pkl'),
-        'category': joblib.load('artifacts/model_2_category.pkl'),
-        'anomaly': joblib.load('artifacts/model_3_anomaly.pkl'),
-        'segmentation': joblib.load('artifacts/model_4_segmentation.pkl'),
-        'risk': joblib.load('artifacts/model_5_risk.pkl'),
-        'goal': joblib.load('artifacts/model_6_goal.pkl'),
-        'churn': joblib.load('artifacts/model_7_churn.pkl'),
-    }
-    return models
+    try:
+        models = {}
+        model_files = {
+            'spending': 'artifacts/model_1_spending.pkl',
+            'category': 'artifacts/model_2_category.pkl',
+            'anomaly': 'artifacts/model_3_anomaly.pkl',
+            'segmentation': 'artifacts/model_4_segmentation.pkl',
+            'risk': 'artifacts/model_5_risk.pkl',
+            'goal': 'artifacts/model_6_goal.pkl',
+            'churn': 'artifacts/model_7_churn.pkl',
+        }
+        
+        for name, path in model_files.items():
+            try:
+                data = joblib.load(path)
+                # Extract actual model from dict if needed
+                if isinstance(data, dict) and 'model' in data:
+                    models[name] = data['model']
+                else:
+                    models[name] = data
+            except FileNotFoundError:
+                st.error(f"❌ Model file not found: {path}")
+                return None
+        
+        return models
+    except Exception as e:
+        st.error(f"❌ Error loading models: {e}")
+        return None
+
 
 # ============================================================================
 # MAIN APP
@@ -65,12 +84,11 @@ def main():
     st.markdown("Predict spending, risks, and financial health using AI")
     
     # Load models
-    try:
-        models = load_models()
-        st.success(" All models loaded successfully!")
-    except Exception as e:
-        st.error(f" Failed to load models: {e}")
-        return
+    models = load_models()
+    if models is None:
+        st.error("❌ Failed to load models. Please check artifact files.")
+        st.stop()
+
     
     # Sidebar - Navigation
     st.sidebar.markdown("# 📋 Navigation")
