@@ -1,783 +1,413 @@
+# app.py
 """
-FinBuddy AI - Interactive Financial Prediction Dashboard
-Streamlit app for model predictions - FIXED VERSION
+Streamlit app to train & deploy the 7 financial models.
+Run: streamlit run app.py
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
-import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime
+import os
+import sys
+import tempfile
+import zipfile
+import io
+from sklearn.model_selection import train_test_split
+import traceback
 
-# ============================================================================
-# PAGE CONFIG
-# ============================================================================
-st.set_page_config(
-    page_title="FinBuddy AI - Financial Predictor",
-    page_icon="💰",
-    layout="wide",
-    initial_sidebar_state="expanded"
+st.set_page_config(page_title="Train All Models", layout="wide")
+
+# ---- Helper: imports of your model classes ----
+# Make sure models/ package is on PYTHONPATH; if not, adjust sys.path
+app_dir = os.path.abspath(os.path.dirname(__file__))
+if app_dir not in sys.path:
+    sys.path.append(app_dir)
+
+try:
+    from models.model_1_spending_prediction import SpendingPredictionModel
+    from models.model_2_category_forecast import CategoryForecastModel
+    from models.model_3_anomaly_detection import AnomalyDetectionModel
+    from models.model_4_user_segmentation import UserSegmentationModel
+    from models.model_5_risk_assessment import RiskAssessmentModel
+    from models.model_6_goal_achievement import GoalAchievementModel
+    from models.model_7_churn_prediction import ChurnPredictionModel
+except Exception as e:
+    st.error("Failed to import model classes from models/ package. Check models package and PYTHONPATH.")
+    st.exception(e)
+    st.stop()
+
+# ---- UI Layout ----
+st.title("Train All 7 Financial Models — Streamlit")
+st.markdown(
+    """
+This app trains all seven models on a Parquet-engineered dataset.  
+You can upload a Parquet file or let the app look for `data/engineered_features_transaction_level.parquet`.
+"""
 )
 
-# Custom CSS
-st.markdown("""
-    <style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 20px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-    .header {
-        color: #1f77e6;
-        font-size: 28px;
-        font-weight: bold;
-        margin-bottom: 20px;
-    }
-    </style>
-""", unsafe_allow_html=True)
+with st.sidebar:
+    st.header("Options")
+    uploaded_file = st.file_uploader("Upload engineered features (Parquet)", type=["parquet", "parq"])
+    use_local = st.checkbox("Use local data/engineered_features_transaction_level.parquet (if exists)", value=True)
+    artifacts_dir = st.text_input("Artifacts directory", value="artifacts")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    random_seed = st.number_input("Random seed", value=42, step=1)
+    run_button = st.button("Start training")
 
-# ============================================================================
-# LOAD MODELS (cached for performance)
-# ============================================================================
-@st.cache_resource
-def load_models():
-    """Load all trained models"""
+# ---- Session state containers ----
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+if "metrics" not in st.session_state:
+    st.session_state.metrics = {}
+if "trained_files" not in st.session_state:
+    st.session_state.trained_files = []
+
+def log(msg, level="info"):
+    st.session_state.logs.append(f"[{level.upper()}] {msg}")
+    # keep log visible
+    st.experimental_rerun() if False else None  # noop to avoid lint issues
+
+def load_parquet_from_upload(uploaded):
     try:
-        models = {}
-        model_files = {
-            'spending': 'artifacts/model_1_spending.pkl',
-            'category': 'artifacts/model_2_category.pkl',
-            'anomaly': 'artifacts/model_3_anomaly.pkl',
-            'segmentation': 'artifacts/model_4_segmentation.pkl',
-            'risk': 'artifacts/model_5_risk.pkl',
-            'goal': 'artifacts/model_6_goal.pkl',
-            'churn': 'artifacts/model_7_churn.pkl',
-        }
-        
-        for name, path in model_files.items():
-            try:
-                data = joblib.load(path)
-                # Extract actual model from dict if needed
-                if isinstance(data, dict) and 'model' in data:
-                    models[name] = data['model']
-                else:
-                    models[name] = data
-            except FileNotFoundError:
-                st.error(f"❌ Model file not found: {path}")
-                return None
-            except Exception as e:
-                st.error(f"❌ Error loading {name} model: {e}")
-                return None
-        
-        return models
+        # read into pandas
+        uploaded.seek(0)
+        df = pd.read_parquet(uploaded)
+        return df
     except Exception as e:
-        st.error(f"❌ Error loading models: {e}")
-        return None
+        raise
 
+def load_parquet_from_path(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    return pd.read_parquet(path)
 
-# ============================================================================
-# MAIN APP
-# ============================================================================
-def main():
-    # Title
-    st.markdown("# 💰 FinBuddy AI - Financial Prediction Engine")
-    st.markdown("Predict spending, risks, and financial health using AI")
-    
-    # Load models
-    models = load_models()
-    if models is None:
-        st.error("❌ Failed to load models. Please check artifact files.")
-        st.info("📝 Make sure all model files are in the 'artifacts/' directory")
-        st.stop()  # ✅ FIXED: Properly indented
+# ---- Data load preview area ----
+data_load_col, preview_col = st.columns([1, 2])
+with data_load_col:
+    st.subheader("Data source")
+    if uploaded_file is not None:
+        st.write("Using uploaded file")
+    else:
+        st.write("Using local file if available")
 
-    
-    # Sidebar - Navigation
-    st.sidebar.markdown("# 📋 Navigation")
-    page = st.sidebar.radio(
-        "Select Prediction Type:",
-        [
-            "Dashboard Overview",
-            "💳 Spending Prediction",
-            "📊 Category Breakdown",
-            "🚨 Anomaly Detection",
-            "👥 User Segmentation",
-            "⚠️ Risk Assessment",
-            "🎯 Goal Achievement",
-            "📉 Churn Prediction",
-            "🔍 Comprehensive Analysis"
-        ]
-    )
-    
-    # ====================================================================
-    # PAGE 1: DASHBOARD OVERVIEW
-    # ====================================================================
-    if page == "Dashboard Overview":
-        st.markdown("## 📊 Dashboard Overview")
-        st.info("Enter your financial data to get AI-powered predictions")
-        
-        # Create columns for input
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            monthly_spending = st.number_input(
-                "Average Monthly Spending (₹)",
-                min_value=0,
-                max_value=1000000,
-                value=25000,
-                step=1000
-            )
-        
-        with col2:
-            spending_volatility = st.slider(
-                "Spending Volatility (0=Consistent, 1=Erratic)",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.3,
-                step=0.1
-            )
-        
-        with col3:
-            online_ratio = st.slider(
-                "💻 Online Spending Ratio",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.5,
-                step=0.1
-            )
-        
-        # Create feature vector
-        if st.button("🚀 Generate Predictions", key="dashboard"):
-            features = create_feature_vector(
-                monthly_spending,
-                spending_volatility,
-                online_ratio
-            )
-            
-            # Make predictions with error handling
-            try:
-                spending_pred = models['spending'].predict([features])[0]
-                risk_proba = models['risk'].predict_proba([features])[0]
-                goal_proba = models['goal'].predict_proba([features])[0]
-                churn_proba = models['churn'].predict_proba([features])[0]
-            except Exception as e:
-                st.error(f"Prediction error: {e}")
-                return
-            
-            # Display results
-            st.markdown("### 📈 Predictions")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric(
-                    "Next Month Spending",
-                    f"₹{spending_pred:,.0f}",
-                    f"₹{spending_pred - monthly_spending:+,.0f}"
-                )
-            
-            with col2:
-                risk_level = "🔴 High" if risk_proba[1] > 0.5 else "🟡 Medium" if risk_proba[1] > 0.3 else "🟢 Low"
-                st.metric(
-                    "Risk Level",
-                    risk_level,
-                    f"{risk_proba[1]:.1%} risk"
-                )
-            
-            with col3:
-                goal_prob = goal_proba[1]
-                st.metric(
-                    "Goal Achievement",
-                    f"{goal_prob:.0%}",
-                    "✅ Likely to achieve" if goal_prob > 0.7 else "⚠️ Uncertain"
-                )
-            
-            with col4:
-                churn_prob = churn_proba[1]
-                churn_label = "🔴 High" if churn_prob > 0.6 else "🟡 Medium" if churn_prob > 0.3 else "🟢 Low"
-                st.metric(
-                    "Churn Risk",
-                    churn_label,
-                    f"{churn_prob:.1%} risk"
-                )
-    
-    # ====================================================================
-    # PAGE 2: SPENDING PREDICTION
-    # ====================================================================
-    elif page == "💳 Spending Prediction":
-        st.markdown("## 💳 Spending Prediction")
-        st.write("Predict your monthly spending based on your financial habits")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            avg_spending = st.number_input(
-                "Average Monthly Spending (₹)",
-                min_value=0,
-                max_value=1000000,
-                value=20000,
-                step=1000
-            )
-            spending_std = st.slider(
-                "Spending Standard Deviation",
-                min_value=0,
-                max_value=50000,
-                value=5000,
-                step=500
-            )
-        
-        with col2:
-            recent_7d = st.number_input(
-                "Last 7 Days Spending (₹)",
-                min_value=0,
-                max_value=100000,
-                value=5000,
-                step=500
-            )
-            recent_30d = st.number_input(
-                "Last 30 Days Spending (₹)",
-                min_value=0,
-                max_value=500000,
-                value=25000,
-                step=500
-            )
-        
-        if st.button("🔮 Predict Spending", key="spending"):
-            features = create_feature_vector(
-                avg_spending, 
-                spending_std/avg_spending if avg_spending > 0 else 0, 
-                0.5
-            )
-            try:
-                prediction = models['spending'].predict([features])[0]
-                
-                st.success(f"💰 Predicted Next Month Spending: ₹{prediction:,.0f}")
-                
-                # Show chart
-                months = ['Last Month', 'Current Month', 'Next Month (Predicted)']
-                amounts = [avg_spending, recent_30d, prediction]
-                
-                fig = go.Figure()
-                fig.add_trace(go.Bar(
-                    x=months, 
-                    y=amounts, 
-                    marker_color=['lightblue', 'skyblue', 'orange']
-                ))
-                fig.update_layout(
-                    title="Spending Trend", 
-                    yaxis_title="Amount (₹)", 
-                    xaxis_title="Month"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"Error making prediction: {e}")
-    
-    # ====================================================================
-    # PAGE 3: CATEGORY BREAKDOWN
-    # ====================================================================
-    elif page == "📊 Category Breakdown":
-        st.markdown("## 📊 Category-wise Spending Forecast")
-        
-        monthly_spending = st.slider(
-            "Total Monthly Spending (₹)",
-            min_value=5000,
-            max_value=500000,
-            value=50000,
-            step=5000
+    selected_path = os.path.join("data", "engineered_features_transaction_level.parquet")
+    st.write("Local path:", selected_path)
+
+with preview_col:
+    st.subheader("Preview")
+    df_preview = None
+    try:
+        if uploaded_file is not None:
+            df_preview = load_parquet_from_upload(uploaded_file)
+        elif use_local and os.path.exists(selected_path):
+            df_preview = load_parquet_from_path(selected_path)
+        else:
+            st.info("No file selected and local file not present.")
+        if df_preview is not None:
+            st.write(f"Loaded DataFrame — {len(df_preview):,} rows × {len(df_preview.columns)} columns")
+            st.dataframe(df_preview.head(50))
+    except Exception as e:
+        st.error("Failed to load Parquet.")
+        st.exception(e)
+        st.stop()
+
+# ---- Core training pipeline ----
+def prepare_features(df):
+    # replicate your script's preparation steps (robust)
+    df = df.copy()
+    # date -> month
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["month"] = df["date"].dt.to_period("M")
+    elif "month" not in df.columns:
+        df["month"] = 1
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    agg_dict = {}
+    for col in numeric_cols:
+        if col not in ["user_id", "amount"]:
+            agg_dict[col] = "mean"
+    if "amount" in numeric_cols:
+        agg_dict["amount"] = ["sum", "mean", "std", "count"]
+
+    df_monthly = df.groupby(["user_id", "month"]).agg(agg_dict).reset_index()
+    # flatten
+    df_monthly.columns = [
+        "_".join(col).strip("_") if isinstance(col, tuple) else col for col in df_monthly.columns.values
+    ]
+
+    # X_monthly
+    X_monthly = df_monthly.select_dtypes(include=[np.number]).copy()
+
+    # target spending
+    if "amount_sum" in X_monthly.columns:
+        y_monthly_spending = X_monthly["amount_sum"].copy()
+        X_monthly = X_monthly.drop("amount_sum", axis=1)
+    elif "amount_mean" in X_monthly.columns:
+        y_monthly_spending = X_monthly["amount_mean"].copy() * X_monthly.get("amount_count", 1)
+        X_monthly = X_monthly.drop("amount_mean", axis=1, errors="ignore")
+        X_monthly = X_monthly.drop("amount_count", axis=1, errors="ignore")
+    else:
+        # fallback
+        if X_monthly.shape[1] < 2:
+            raise ValueError("Not enough numeric columns to create a target and features.")
+        y_monthly_spending = X_monthly.iloc[:, 0].copy()
+        X_monthly = X_monthly.iloc[:, 1:]
+
+    valid_idx = ~y_monthly_spending.isna()
+    y_monthly_spending = y_monthly_spending[valid_idx]
+    X_monthly = X_monthly.loc[valid_idx, :]
+
+    y_monthly_risk = (X_monthly.get("spending_volatility", pd.Series(0, index=X_monthly.index)) > 0.5).astype(int)
+    y_monthly_goal = (y_monthly_spending < y_monthly_spending.rolling(3, min_periods=1).mean()).astype(int).fillna(0)
+
+    X_user = X_monthly.groupby(df_monthly.loc[valid_idx, "user_id"]).mean()
+
+    X_transaction = df.select_dtypes(include=[np.number]).copy()
+    for col in ["user_id", "transaction_id", "amount", "month"]:
+        X_transaction = X_transaction.drop(col, axis=1, errors="ignore")
+
+    return {
+        "df_monthly": df_monthly,
+        "X_monthly": X_monthly,
+        "y_spending": y_monthly_spending,
+        "y_risk": y_monthly_risk,
+        "y_goal": y_monthly_goal,
+        "X_user": X_user,
+        "X_transaction": X_transaction,
+    }
+
+def save_model(model_obj, path):
+    try:
+        model_obj.save(path)
+    except Exception:
+        # Try pickle as fallback
+        import joblib
+        joblib.dump(model_obj, path)
+
+def run_training_pipeline(df, artifacts_dir, seed=42, progress_callback=None, log_callback=None):
+    """Runs training for all 7 models. Returns metrics dict and saved model file list."""
+    np.random.seed(seed)
+    results = {}
+    saved_files = []
+
+    # Prepare
+    if log_callback: log_callback("Preparing features...")
+    feats = prepare_features(df)
+
+    X_monthly = feats["X_monthly"]
+    y_spending = feats["y_spending"]
+    y_risk = feats["y_risk"]
+    y_goal = feats["y_goal"]
+    X_user = feats["X_user"]
+    X_transaction = feats["X_transaction"]
+
+    total_steps = 7
+    step = 0
+
+    # 1 Spending prediction
+    step += 1
+    if progress_callback: progress_callback(step, total_steps, f"Training Spending Prediction ({step}/{total_steps})")
+    try:
+        X_train_1, X_test_1, y_train_1, y_test_1 = train_test_split(
+            X_monthly, y_spending, test_size=0.2, random_state=seed
         )
-        
-        if st.button("📈 Forecast Categories", key="category"):
-            features = create_feature_vector(monthly_spending, 0.3, 0.5)
-            try:
-                category_pred = models['category'].predict([features])[0]
-                
-                # Check if category_names exists, otherwise use generic names
-                if hasattr(models['category'], 'category_names'):
-                    category_names = models['category'].category_names
-                else:
-                    category_names = [f"Category {i+1}" for i in range(len(category_pred))]
-                
-                # Create dataframe
-                df_cat = pd.DataFrame({
-                    'Category': category_names,
-                    'Spending': category_pred
-                }).sort_values('Spending', ascending=False)
-                
-                # Pie chart
-                fig = px.pie(
-                    df_cat, 
-                    values='Spending', 
-                    names='Category', 
-                    title="Category Breakdown"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Table
-                st.dataframe(
-                    df_cat.style.format({'Spending': '₹{:,.0f}'}), 
-                    use_container_width=True
-                )
-            except Exception as e:
-                st.error(f"Error forecasting categories: {e}")
-    
-    # ====================================================================
-    # PAGE 4: ANOMALY DETECTION
-    # ====================================================================
-    elif page == "🚨 Anomaly Detection":
-        st.markdown("## 🚨 Detect Unusual Transactions")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            transaction_amount = st.number_input(
-                "Transaction Amount (₹)",
-                min_value=0,
-                max_value=100000,
-                value=5000,
-                step=100
-            )
-        
-        with col2:
-            hour = st.slider(
-                "Hour of Transaction (0-23)",
-                min_value=0,
-                max_value=23,
-                value=14
-            )
-        
-        with col3:
-            is_online = st.selectbox("Transaction Type", ["Online", "Offline"])
-        
-        if st.button("🔍 Check for Anomaly", key="anomaly"):
-            features = create_feature_vector(
-                transaction_amount, 
-                0.1, 
-                1.0 if is_online == "Online" else 0.0
-            )
-            try:
-                # ✅ FIXED: Get the anomaly probability correctly
-                anomaly_proba = models['anomaly'].predict_proba([features])[0]
-                anomaly_score = anomaly_proba[1] if len(anomaly_proba) > 1 else anomaly_proba[0]
-                
-                if anomaly_score > 0.5:
-                    st.warning(f"⚠️ ANOMALY DETECTED! Risk Score: {anomaly_score:.1%}")
-                else:
-                    st.success(f"✅ NORMAL TRANSACTION. Risk Score: {anomaly_score:.1%}")
-            except Exception as e:
-                st.error(f"Error detecting anomaly: {e}")
-    
-    # ====================================================================
-    # PAGE 5: USER SEGMENTATION
-    # ====================================================================
-    elif page == "👥 User Segmentation":
-        st.markdown("## 👥 User Segment Classification")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            category_count = st.slider("Number of Categories Used", 1, 12, 5)
-        
-        with col2:
-            avg_transaction = st.number_input("Average Transaction (₹)", 1000, 50000, 10000)
-        
-        with col3:
-            freq_score = st.slider("Transaction Frequency", 0.0, 1.0, 0.5)
-        
-        if st.button("🔍 Find Segment", key="segment"):
-            features = create_feature_vector(
-                category_count * avg_transaction, 
-                0.3, 
-                freq_score
-            )
-            try:
-                segment = models['segmentation'].predict([features])[0]
-                
-                # Check if predict_proba exists
-                if hasattr(models['segmentation'], 'predict_proba'):
-                    segment_proba = models['segmentation'].predict_proba([features])[0]
-                    n_segments = len(segment_proba)
-                else:
-                    n_segments = 5
-                    segment_proba = [0.2] * n_segments
-                    segment_proba[segment] = 0.8
-                
-                st.info(f"### 🎯 You belong to: **Segment {segment}**")
-                
-                # Show segment distribution
-                fig = go.Figure()
-                fig.add_trace(go.Bar(
-                    x=[f"Segment {i}" for i in range(n_segments)],
-                    y=segment_proba,
-                    marker_color=['green' if i == segment else 'lightblue' for i in range(n_segments)]
-                ))
-                fig.update_layout(title="Segment Probability", yaxis_title="Probability")
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"Error finding segment: {e}")
-    
-    # ====================================================================
-    # PAGE 6: RISK ASSESSMENT
-    # ====================================================================
-    elif page == "⚠️ Risk Assessment":
-        st.markdown("## ⚠️ Financial Risk Assessment")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            monthly_income = st.number_input(
-                "Monthly Income (₹)",
-                min_value=0,
-                max_value=1000000,
-                value=50000,
-                step=5000
-            )
-        
-        with col2:
-            monthly_spending = st.number_input(
-                "Monthly Spending (₹)",
-                min_value=0,
-                max_value=1000000,
-                value=30000,
-                step=5000
-            )
-        
-        with col3:
-            savings_rate = st.slider(
-                "Savings Rate",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.4
-            )
-        
-        if st.button("🔍 Assess Risk", key="risk"):
-            features = create_feature_vector(
-                monthly_spending, 
-                abs(monthly_income - monthly_spending) / monthly_income if monthly_income > 0 else 0, 
-                savings_rate
-            )
-            try:
-                risk_proba = models['risk'].predict_proba([features])[0]
-                
-                risk_level = 0 if risk_proba[0] > 0.5 else 1
-                risk_label = ["🟢 Low Risk", "🔴 High Risk"][risk_level]
-                
-                st.success(f"### {risk_label}")
-                st.write(f"Risk Score: {risk_proba[risk_level]:.1%}")
-                
-                if risk_level == 1:
-                    st.warning("⚠️ Recommendations: Increase savings, reduce unnecessary expenses")
-                else:
-                    st.success("✅ Your financial health looks good!")
-            except Exception as e:
-                st.error(f"Error assessing risk: {e}")
-    
-    # ====================================================================
-    # PAGE 7: GOAL ACHIEVEMENT
-    # ====================================================================
-    elif page == "🎯 Goal Achievement":
-        st.markdown("## 🎯 Will You Achieve Your Financial Goal?")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            goal_amount = st.number_input(
-                "Financial Goal Amount (₹)",
-                min_value=0,
-                max_value=10000000,
-                value=100000,
-                step=10000
-            )
-            timeframe_months = st.slider(
-                "Timeframe (months)",
-                min_value=1,
-                max_value=60,
-                value=12
-            )
-        
-        with col2:
-            current_savings = st.number_input(
-                "Current Savings (₹)",
-                min_value=0,
-                max_value=10000000,
-                value=20000,
-                step=5000
-            )
-            monthly_savings = st.number_input(
-                "Monthly Savings Capacity (₹)",
-                min_value=0,
-                max_value=100000,
-                value=5000,
-                step=500
-            )
-        
-        if st.button("🎯 Check Goal Achievement", key="goal"):
-            features = create_feature_vector(monthly_savings, 0.1, 0.5)
-            try:
-                goal_proba = models['goal'].predict_proba([features])[0]
-                
-                projected_savings = current_savings + (monthly_savings * timeframe_months)
-                achievement_prob = goal_proba[1]
-                
-                st.metric("Achievement Probability", f"{achievement_prob:.1%}")
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Goal Amount", f"₹{goal_amount:,.0f}")
-                with col2:
-                    st.metric("Projected Savings", f"₹{projected_savings:,.0f}")
-                with col3:
-                    shortfall = goal_amount - projected_savings
-                    st.metric(
-                        "Gap", 
-                        f"₹{shortfall:,.0f}" if shortfall > 0 else f"₹{abs(shortfall):,.0f} Surplus"
-                    )
-                
-                if achievement_prob > 0.7:
-                    st.success(f"✅ You will likely achieve your goal!")
-                else:
-                    st.warning(f"⚠️ You may not achieve your goal. Increase monthly savings.")
-            except Exception as e:
-                st.error(f"Error checking goal: {e}")
-    
-    # ====================================================================
-    # PAGE 8: CHURN PREDICTION
-    # ====================================================================
-    elif page == "📉 Churn Prediction":
-        st.markdown("## 📉 User Engagement & Churn Risk")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            days_since_last = st.slider(
-                "Days Since Last Activity",
-                min_value=0,
-                max_value=365,
-                value=5
-            )
-            login_frequency = st.slider(
-                "Monthly Logins",
-                min_value=0,
-                max_value=30,
-                value=10
-            )
-        
-        with col2:
-            features_used = st.slider(
-                "Features Used (out of 10)",
-                min_value=0,
-                max_value=10,
-                value=7
-            )
-        
-        with col3:
-            goal_progress = st.slider(
-                "Goal Progress (%)",
-                min_value=0,
-                max_value=100,
-                value=50
-            )
-        
-        if st.button("📊 Predict Churn Risk", key="churn"):
-            # Create engagement score
-            engagement_score = (login_frequency / 30) * (features_used / 10) * (100 - days_since_last / 365 * 100) / 100
-            
-            features = create_feature_vector(
-                engagement_score * 50000, 
-                0.1, 
-                engagement_score
-            )
-            try:
-                churn_proba = models['churn'].predict_proba([features])[0]
-                churn_prob = churn_proba[1]
-                
-                if churn_prob > 0.6:
-                    st.error(f"🔴 CRITICAL - User likely to churn: {churn_prob:.1%}")
-                    st.warning("**Recommended Actions:**")
-                    st.write("1. Send personalized retention offer")
-                    st.write("2. Highlight new features and benefits")
-                    st.write("3. Offer premium trial or discount")
-                    st.write("4. Schedule 1-on-1 support call")
-                elif churn_prob > 0.3:
-                    st.warning(f"🟡 MEDIUM RISK - {churn_prob:.1%}")
-                    st.write("**Recommended Actions:**")
-                    st.write("1. Increase engagement notifications")
-                    st.write("2. Share success stories and tips")
-                    st.write("3. Offer loyalty rewards")
-                else:
-                    st.success(f"🟢 LOW RISK - User is engaged: {churn_prob:.1%}")
-            except Exception as e:
-                st.error(f"Error predicting churn: {e}")
-    
-    # ====================================================================
-    # PAGE 9: COMPREHENSIVE ANALYSIS
-    # ====================================================================
-    elif page == "🔍 Comprehensive Analysis":
-        st.markdown("## 🔍 Complete Financial Profile Analysis")
-        
-        st.write("Enter your complete financial information for a comprehensive analysis")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            monthly_income = st.number_input("Monthly Income", 10000, 500000, 50000)
-            monthly_spending = st.number_input("Monthly Spending", 5000, 400000, 30000)
-            savings_goal = st.number_input("Monthly Savings Goal", 0, 100000, 10000)
-        
-        with col2:
-            online_ratio = st.slider("Online Shopping %", 0, 100, 50)
-            categories_used = st.slider("Categories Used", 1, 12, 6)
-            days_since_transaction = st.slider("Days Since Last Transaction", 0, 30, 1)
-        
-        with col3:
-            year_as_user = st.slider("Years as User", 0, 10, 1)
-            transaction_frequency = st.number_input("Transactions per Month", 1, 1000, 100)
-            goal_amount = st.number_input("Financial Goal (₹)", 10000, 10000000, 500000)
-        
-        if st.button("🚀 Generate Complete Analysis", key="complete"):
-            features = create_feature_vector(
-                monthly_spending, 
-                abs(monthly_income - monthly_spending) / monthly_income if monthly_income > 0 else 0, 
-                online_ratio / 100
-            )
-            
-            try:
-                # Get all predictions
-                spending_pred = models['spending'].predict([features])[0]
-                category_pred = models['category'].predict([features])[0]
-                segment = models['segmentation'].predict([features])[0]
-                risk_proba = models['risk'].predict_proba([features])[0]
-                goal_proba = models['goal'].predict_proba([features])[0]
-                churn_proba = models['churn'].predict_proba([features])[0]
-                
-                # Display dashboard
-                st.markdown("### 📊 Analysis Dashboard")
-                
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric(
-                        "Predicted Spending", 
-                        f"₹{spending_pred:,.0f}", 
-                        f"{(spending_pred/monthly_spending - 1)*100:+.1f}%" if monthly_spending > 0 else "N/A"
-                    )
-                
-                with col2:
-                    st.metric(
-                        "Risk Level", 
-                        ["🟢 Low", "🔴 High"][int(risk_proba[1] > 0.5)], 
-                        f"{risk_proba[1]:.1%}"
-                    )
-                
-                with col3:
-                    # Check if predict_proba exists for segmentation
-                    if hasattr(models['segmentation'], 'predict_proba'):
-                        seg_confidence = max(models['segmentation'].predict_proba([features])[0]) * 100
-                    else:
-                        seg_confidence = 80
-                    st.metric(
-                        "User Segment", 
-                        f"Segment {segment}", 
-                        f"{seg_confidence:.0f}% match"
-                    )
-                
-                with col4:
-                    st.metric(
-                        "Churn Risk", 
-                        ["🟢 Low", "🟡 Med", "🔴 High"][min(2, int(churn_proba[1] * 3))], 
-                        f"{churn_proba[1]:.1%}"
-                    )
-                
-                # Savings analysis
-                st.markdown("### 💰 Savings & Goal Analysis")
-                
-                monthly_surplus = monthly_income - monthly_spending - savings_goal
-                months_to_goal = (goal_amount / savings_goal) if savings_goal > 0 else float('inf')
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Monthly Surplus", f"₹{monthly_surplus:,.0f}")
-                
-                with col2:
-                    st.metric(
-                        "Months to Goal", 
-                        f"{min(months_to_goal, 120):.0f}" if months_to_goal != float('inf') else "∞"
-                    )
-                
-                with col3:
-                    goal_achievement = goal_proba[1]
-                    st.metric(
-                        "Goal Probability", 
-                        f"{goal_achievement:.1%}", 
-                        "✅ On track" if goal_achievement > 0.7 else "⚠️ At risk"
-                    )
-                
-                # Recommendations
-                st.markdown("### 💡 Recommendations")
-                
-                recommendations = []
-                
-                if risk_proba[1] > 0.5:
-                    recommendations.append("⚠️ Reduce spending volatility - establish fixed budget")
-                
-                if churn_proba[1] > 0.6:
-                    recommendations.append("📱 Increase app engagement - explore new features")
-                
-                if goal_proba[1] < 0.5:
-                    recommendations.append("💰 Increase monthly savings - reassess spending patterns")
-                
-                if online_ratio > 70:
-                    recommendations.append("💳 Consider cashback options for online purchases")
-                
-                if transaction_frequency < 50:
-                    recommendations.append("📊 Increase tracking - monitor all expenses")
-                
-                if recommendations:
-                    for rec in recommendations:
-                        st.info(rec)
-                else:
-                    st.success("✅ Your financial health is excellent!")
-            
-            except Exception as e:
-                st.error(f"Error generating analysis: {e}")
-                st.exception(e)
+        model1 = SpendingPredictionModel(rf_estimators=100, gb_estimators=100)
+        model1.train(X_train_1, y_train_1)
+        metrics1 = model1.evaluate(X_test_1, y_test_1)
+        p = os.path.join(artifacts_dir, "model_1_spending.pkl")
+        save_model(model1, p)
+        saved_files.append(p)
+        results["model_1"] = metrics1
+        if log_callback: log_callback(f"Model 1 done — MAE: {metrics1.get('mae')}, R2: {metrics1.get('r2')}")
+    except Exception as e:
+        if log_callback: log_callback(f"Model 1 failed: {e}", level="error")
+        results["model_1"] = {"error": str(e), "trace": traceback.format_exc()}
 
-# ============================================================================
-# HELPER FUNCTION
-# ============================================================================
-def create_feature_vector(spending, volatility, online_ratio, n_features=66):
-    """Create feature vector for predictions - FIXED VERSION"""
-    features = np.zeros(n_features)
-    
-    # Fill relevant features with deterministic values
-    features[0] = spending
-    features[5] = volatility
-    features[10] = online_ratio
-    features[15] = spending * 0.7  # 7-day average
-    features[16] = spending * 0.8  # 30-day average
-    features[20] = volatility
-    features[25] = volatility * 100
-    features[30] = 1.0 if spending > 20000 else 0.0
-    features[35] = spending / 7
-    features[36] = spending
-    features[40] = online_ratio
-    features[45] = 6.0  # ✅ FIXED: Use constant instead of random
-    features[50] = 0.5
-    features[55] = online_ratio * 0.6
-    features[60] = 1 - volatility
-    
-    # ✅ FIXED: Fill remaining with deterministic values based on existing features
-    for i in range(n_features):
-        if features[i] == 0:
-            # Use a deterministic value based on position and existing features
-            features[i] = (spending / 1000 + volatility * 50 + online_ratio * 50 + i) % 100
-    
-    return features
+    # 2 Category forecast
+    step += 1
+    if progress_callback: progress_callback(step, total_steps, f"Training Category Forecast ({step}/{total_steps})")
+    try:
+        category_cols = [col for col in df.columns if col.startswith("cat_")]
+        if len(category_cols) > 1:
+            y_categories = df[category_cols + ["user_id", "month"]].groupby(["user_id", "month"])[category_cols].sum().reset_index()
+            y_categories = y_categories.drop(["user_id", "month"], axis=1)
+            # if shapes mismatch, try to align by index through join on user_id+month
+            if len(y_categories) == len(X_monthly):
+                X_train_2, X_test_2, y_train_2, y_test_2 = train_test_split(
+                    X_monthly, y_categories, test_size=0.2, random_state=seed
+                )
+                model2 = CategoryForecastModel(n_estimators=100)
+                model2.train(X_train_2, y_train_2)
+                metrics2 = model2.evaluate(X_test_2, y_test_2)
+                p = os.path.join(artifacts_dir, "model_2_category.pkl")
+                save_model(model2, p)
+                saved_files.append(p)
+                results["model_2"] = metrics2
+                if log_callback: log_callback(f"Model 2 done — avg R2: {metrics2.get('avg_r2')}")
+            else:
+                results["model_2"] = {"skipped": "dimension_mismatch"}
+                if log_callback: log_callback("Model 2 skipped due to dimension mismatch", level="warning")
+        else:
+            results["model_2"] = {"skipped": "not_enough_categories"}
+            if log_callback: log_callback("Model 2 skipped: not enough category columns", level="warning")
+    except Exception as e:
+        if log_callback: log_callback(f"Model 2 failed: {e}", level="error")
+        results["model_2"] = {"error": str(e), "trace": traceback.format_exc()}
 
-# ============================================================================
-# RUN APP
-# ============================================================================
-if __name__ == "__main__":
-    main()
+    # 3 Anomaly detection
+    step += 1
+    if progress_callback: progress_callback(step, total_steps, f"Training Anomaly Detection ({step}/{total_steps})")
+    try:
+        model3 = AnomalyDetectionModel(contamination=0.05)
+        model3.train(X_transaction)
+        p = os.path.join(artifacts_dir, "model_3_anomaly.pkl")
+        save_model(model3, p)
+        saved_files.append(p)
+        results["model_3"] = {"transactions_analyzed": len(X_transaction)}
+        if log_callback: log_callback(f"Model 3 done — transactions: {len(X_transaction):,}")
+    except Exception as e:
+        if log_callback: log_callback(f"Model 3 failed: {e}", level="error")
+        results["model_3"] = {"error": str(e), "trace": traceback.format_exc()}
+
+    # 4 User segmentation
+    step += 1
+    if progress_callback: progress_callback(step, total_steps, f"Training User Segmentation ({step}/{total_steps})")
+    try:
+        model4 = UserSegmentationModel(n_clusters=5, method="kmeans")
+        model4.train(X_user)
+        metrics4 = model4.evaluate(X_user)
+        p = os.path.join(artifacts_dir, "model_4_segmentation.pkl")
+        save_model(model4, p)
+        saved_files.append(p)
+        results["model_4"] = metrics4
+        if log_callback: log_callback(f"Model 4 done — Silhouette: {metrics4.get('silhouette_score')}")
+    except Exception as e:
+        if log_callback: log_callback(f"Model 4 failed: {e}", level="error")
+        results["model_4"] = {"error": str(e), "trace": traceback.format_exc()}
+
+    # 5 Risk assessment
+    step += 1
+    if progress_callback: progress_callback(step, total_steps, f"Training Risk Assessment ({step}/{total_steps})")
+    try:
+        X_train_5, X_test_5, y_train_5, y_test_5 = train_test_split(
+            X_monthly, y_risk, test_size=0.2, random_state=seed
+        )
+        model5 = RiskAssessmentModel(max_depth=6, learning_rate=0.1)
+        model5.train(X_train_5, y_train_5)
+        metrics5 = model5.evaluate(X_test_5, y_test_5)
+        p = os.path.join(artifacts_dir, "model_5_risk.pkl")
+        save_model(model5, p)
+        saved_files.append(p)
+        results["model_5"] = metrics5
+        if log_callback: log_callback(f"Model 5 done — Accuracy: {metrics5.get('accuracy')}")
+    except Exception as e:
+        if log_callback: log_callback(f"Model 5 failed: {e}", level="error")
+        results["model_5"] = {"error": str(e), "trace": traceback.format_exc()}
+
+    # 6 Goal achievement
+    step += 1
+    if progress_callback: progress_callback(step, total_steps, f"Training Goal Achievement ({step}/{total_steps})")
+    try:
+        X_train_6, X_test_6, y_train_6, y_test_6 = train_test_split(
+            X_monthly, y_goal, test_size=0.2, random_state=seed
+        )
+        model6 = GoalAchievementModel(n_estimators=100, max_depth=7)
+        model6.train(X_train_6, y_train_6)
+        metrics6 = model6.evaluate(X_test_6, y_test_6)
+        p = os.path.join(artifacts_dir, "model_6_goal.pkl")
+        save_model(model6, p)
+        saved_files.append(p)
+        results["model_6"] = metrics6
+        if log_callback: log_callback(f"Model 6 done — Accuracy: {metrics6.get('accuracy')}")
+    except Exception as e:
+        if log_callback: log_callback(f"Model 6 failed: {e}", level="error")
+        results["model_6"] = {"error": str(e), "trace": traceback.format_exc()}
+
+    # 7 Churn prediction (note: original used y_monthly_goal as a placeholder)
+    step += 1
+    if progress_callback: progress_callback(step, total_steps, f"Training Churn Prediction ({step}/{total_steps})")
+    try:
+        X_train_7, X_test_7, y_train_7, y_test_7 = train_test_split(
+            X_monthly, y_goal, test_size=0.2, random_state=seed
+        )
+        model7 = ChurnPredictionModel(n_estimators=100)
+        model7.train(X_train_7, y_train_7)
+        metrics7 = model7.evaluate(X_test_7, y_test_7)
+        p = os.path.join(artifacts_dir, "model_7_churn.pkl")
+        save_model(model7, p)
+        saved_files.append(p)
+        results["model_7"] = metrics7
+        if log_callback: log_callback(f"Model 7 done — Accuracy: {metrics7.get('accuracy')}")
+    except Exception as e:
+        if log_callback: log_callback(f"Model 7 failed: {e}", level="error")
+        results["model_7"] = {"error": str(e), "trace": traceback.format_exc()}
+
+    return results, saved_files
+
+# ---- Training invocation ----
+if run_button:
+    if df_preview is None:
+        st.error("No data loaded. Upload a Parquet or enable/use the local file.")
+    else:
+        # Clear logs
+        st.session_state.logs = []
+        st.session_state.metrics = {}
+        st.session_state.trained_files = []
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        log_box = st.empty()
+
+        def progress_cb(step, total, message=None):
+            frac = int((step / total) * 100)
+            progress_bar.progress(frac)
+            if message:
+                status_text.info(message)
+
+        def log_cb(message, level="info"):
+            st.session_state.logs.append(f"[{level.upper()}] {message}")
+            # update log box
+            with log_box.container():
+                st.write("\n".join(st.session_state.logs[-200:]))
+
+        try:
+            with st.spinner("Training... this runs sequentially and may take time depending on data and models"):
+                metrics, saved_files = run_training_pipeline(
+                    df_preview, artifacts_dir=artifacts_dir, seed=int(random_seed),
+                    progress_callback=progress_cb, log_callback=log_cb
+                )
+
+            st.success("Training run finished.")
+            st.session_state.metrics = metrics
+            st.session_state.trained_files = saved_files
+
+            # Show metrics
+            st.subheader("Metrics / Results")
+            for k, v in metrics.items():
+                st.write(f"**{k}**")
+                st.json(v)
+
+            # Show saved model files
+            st.subheader("Saved artifact files")
+            for f in saved_files:
+                st.write(f"• {f} — {os.path.getsize(f):,} bytes")
+
+            # Provide ZIP download
+            if saved_files:
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for fp in saved_files:
+                        arcname = os.path.basename(fp)
+                        zf.write(fp, arcname)
+                buf.seek(0)
+                st.download_button("Download all models (zip)", data=buf, file_name="models_artifacts.zip", mime="application/zip")
+        except Exception as e:
+            st.error("Training failed with an exception.")
+            st.exception(e)
+            st.write("Traceback (latest logs):")
+            st.write("\n".join(st.session_state.logs[-50:]))
+
+# ---- Logs viewer ----
+st.subheader("Run logs")
+st.text_area("Logs", value="\n".join(st.session_state.logs[-500:]), height=300)
