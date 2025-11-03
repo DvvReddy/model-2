@@ -1,8 +1,4 @@
-"""
-Financial Models Package
-Imports all 7 model classes for easy access
-"""
-
+"""Financial Models Package"""
 from .model_1_spending_prediction import SpendingPredictionModel
 from .model_2_category_forecast import CategoryForecastModel
 from .model_3_anomaly_detection import AnomalyDetectionModel
